@@ -17,7 +17,7 @@
  *  - `<dir>` 부터 대상까지 **모든 구성요소를 lstat** — 하나라도 심볼릭 링크면 그 스킬 skip(reason symlink). realpath 봉인.
  *  - git 이 추적 중인 경로(`git ls-files`)는 덮어쓰지 않고 경고. 파일 0644(실행 비트 없음).
  *  - 삭제는 `.pax-managed` 마커가 일반 파일인 `pax-*` 디렉터리만. degraded·도구 오류(킬스위치 deny 포함)면 삭제 0건. skipped 이름은 삭제 제외.
- *  - 교체는 `pax-x.new-<pid>` 조립 → 기존 `.old-<pid>` rename → new→final → old 삭제. 캡 50개·1MB·파일당 100KB. 셸 디렉티브 재검사.
+ *  - 교체는 `pax-x.new-<pid>` 조립 → 기존 `.old-<pid>` rename → new→final → old 삭제. 캡 50개·3MB·파일당 100KB. 셸 디렉티브 재검사.
  *  - 잠금·안내 스탬프·보관본은 저장소 밖 `~/.config/vibeagent/<instance>/state/<폴더 해시>/`(0700) — `.git` 아래에 두면
  *    `.git` 파일의 `gitdir:` 이나 심볼릭 링크로 홈의 다른 파일을 덮어쓰는 경로가 된다.
  *  - 마커 v2(`v=2`·`instance=<pax|pax-id>`·`file=<sha256> <path>`)로 **이 PC 에서 고친 사본**을 알아보고, 되돌리기 전에 보관한다.
@@ -40,11 +40,11 @@ import { callTool, resultText, PLUGIN_ID } from './lib/rpc.mjs';
 import { containsShellDirective } from './lib/skillGuard.mjs';
 
 const MCP_URL = process.env.CLAUDE_CODE_MCP_SERVER_URL || 'https://pable-pax-for-sp.vercel.app/api/local-ai/mcp';
-const PLUGIN_VERSION = '2.3.1';
+const PLUGIN_VERSION = '2.3.2';
 /** 이 플러그인의 설치 이름 — 마커 `instance=` 에 기록(원본도 명시값: 빈 값이면 마커 없는 옛 사본과 구분이 안 된다). */
 const PLUGIN_NAME = PLUGIN_ID ? `pax-${PLUGIN_ID}` : 'pax';
 const MAX_SKILLS = 50;
-const MAX_TOTAL = 1024 * 1024;
+const MAX_TOTAL = 3 * 1024 * 1024; // 서버 SKILLS_BUNDLE_MAX_BYTES 와 같은 값(2.3.2 에서 1MB→3MB — 천장은 Vercel 응답 본문 4.5MB)
 const MAX_FILE = 100 * 1024;
 const NAME_RE = /^pax-[a-z][a-z0-9-]*[a-z0-9]$/;
 const TMP_RE = /^(pax-[a-z][a-z0-9-]*[a-z0-9])\.(new|old)-\d+$/;
