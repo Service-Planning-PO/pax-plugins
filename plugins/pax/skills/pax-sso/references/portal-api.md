@@ -6,28 +6,36 @@ SSO 로그인 후 만든 서비스가 **pable studio 데이터(조직·사용자
 
 ## 인증 모델
 
-- 호출 인증 = **세션 쿠키에 담긴 재서명 JWT를 그대로 `Authorization: Bearer`** 로 전달. 서비스의 `SSO_SECRET`(서비스별 키)으로 HS256 서명된 토큰이면 된다.
-- `payload.service` 클레임이 자기 서비스 ID와 정확히 일치해야 한다(다른 서비스 키로 서명하면 401).
-- **Bearer 호출 자격** = pable studio에 SSO 키가 발급돼 있고(`sso_secret_enc IS NOT NULL`) `granted_scopes`가 1개 이상. 스코프 0개면 self-read 조차 401.
-- **호출 대상 주소는 세션의 `portal_origin` 우선, env `PORTAL_URL` 폴백** (SKILL.md 의 `resolvePortalOrigin`). env 고정 주소로 호출하면 pable studio 도메인이 바뀔 때 cross-origin 리다이렉트에서 `Authorization` 헤더가 삭제돼 **전부 401** 이 된다.
-- **쿠키를 직접 읽지 마라** — 반드시 `getSession()`(서명 검증 통과)을 거친다. 검증 전 토큰의 `portal_origin` 으로 호출하면 위조 토큰이 Bearer 자격증명을 임의 호스트로 빼돌릴 수 있다.
+- Bearer = **서버 라우트에서 `getAccessToken()`**(`sso-v2.md` 의 `lib/portal-token.ts`)으로 받은 **pable studio 접근 토큰**. 60초짜리라 `getAccessToken()` 이 로그인 유지(refresh)로 알아서 새로 받는다.
+  앱 세션 JWT(자체 서명)를 Bearer 로 보내면 401 이다 — 세션에는 Bearer 토큰이 없다.
+- **호출 주소는 `access.portalOrigin`**(= `PORTAL_URL`, 토큰 발급자와 같은 주소). 쿼리·요청 값으로 주소를 만들지 마라.
+- **Bearer 호출 자격** = 비밀값(client secret) 클라이언트 + 승인 스코프 1개 이상 + 토큰 `tenant_id` 가 **등록 회사**. 스코프 0개면 본인 조회까지 401, 다른 회사 계정(운영자 직권 진입 포함)으로 로그인한 세션도 사내 데이터를 부르지 못한다.
+- 토큰은 응답 본문·로그·클라이언트 컴포넌트에 싣지 않는다(서버 라우트 안에서만 쓴다).
+- **사람 없이 부르는 호출(크론·예약 작업·정기 발송)은 이 방식으로 하지 않는다** — 접근 토큰은 로그인한 사람이 있을 때만 받는다. 로그인 유지(refresh)·접근 토큰을 저장해 두고 나중에 쓰지 마라(SKILL.md "사람 없이 자동으로 부르는 기능").
+  사람 없이 할 수 있는 것은 **시스템 메일 발송(`send-as`)뿐**이고, 그때 Bearer 는 **자동 발송용 키(`SSO_SERVER_SECRET`)로 받은 서버 토큰**이다(`sso-v2.md` "자동 발송" 절). 서버 토큰으로 다른 엔드포인트를 부르지 마라(거절된다).
+- (기존 v1 앱의 Bearer 는 `sso-v1.md` §6 — 새 앱에 쓰지 마라.)
 
 ```ts
-// 서버 라우트 안에서 — 검증된 세션의 토큰과 origin 을 함께 쓴다
-const session = await getSession()            // SKILL.md 의 헬퍼 (jwtVerify 통과)
-// ⚠️ getSession·resolvePortalOrigin 은 **이 라우트 파일에도 그대로 복사 선언**한다.
-//    import 하지 마라 — page.tsx 에서 export 하면 Next 가 타입 에러로 막는다
-//    (COOKIE_NAME·getSecret 을 파일마다 중복 선언하는 것과 같은 이유).
-if (!session?.token) return new Response(null, { status: 401 })
-const origin = resolvePortalOrigin(session)   // portal_origin → env → null
-if (!origin) return new Response(null, { status: 503 })  // pable studio 주소 미설정 — 호출 자체를 안 한다
+// 서버 라우트 안에서 — 토큰은 응답에 싣지 않는다
+import { getSession } from '@/lib/sso'
+import { getAccessToken } from '@/lib/portal-token'
 
-const res = await fetch(`${origin}/api/org/users/${encodeURIComponent(email)}`, {
-  headers: { Authorization: `Bearer ${session.token}` },
+const session = await getSession()
+if (!session) return Response.json({ code: 'sso_required' }, { status: 401 })
+const access = await getAccessToken()
+if (!access.ok) {
+  if (access.reason === 'dev_bypass') return Response.json({ user: null }) // mock — 예시 데이터·빈 상태로 대신한다
+  return access.reason === 'login_required'
+    ? Response.json({ code: 'sso_required' }, { status: 401 }) // 화면은 /auth/sso 링크로 안내(자동 반복 이동 금지)
+    : Response.json({ code: 'unavailable' }, { status: 503 })
+}
+const res = await fetch(`${access.portalOrigin}/api/org/users/${encodeURIComponent(email)}`, {
+  headers: { Authorization: `Bearer ${access.token}` },
+  cache: 'no-store',
 })
 ```
 
-> **DEV_BYPASS 함정** — mock 세션은 `token: null` 이라 pable studio API 호출이 불가능하다(401). 로컬 mock 으로는 pable studio 데이터 화면을 확인할 수 없으니, 픽스처나 빈 상태로 폴백하고 **실제 데이터는 실제 SSO 왕복으로** 확인한다.
+> **DEV_BYPASS 함정** — mock 세션에는 pable studio 접근 토큰이 없어(`getAccessToken()` 이 `reason: 'dev_bypass'`) pable studio API 를 부를 수 없다. 로컬 mock 으로는 pable studio 데이터 화면을 확인할 수 없으니, 픽스처나 빈 상태로 폴백하고 **실제 데이터는 실제 SSO 왕복으로** 확인한다.
 
 ## 엔드포인트 카탈로그
 
@@ -43,13 +51,13 @@ const res = await fetch(`${origin}/api/org/users/${encodeURIComponent(email)}`, 
 | GET | `/api/graph/presence/{email}` | `graph.Presence.Read.All` (**본인 면제**) | 프레즌스 단건 |
 | POST | `/api/graph/presence` | `graph.Presence.Read.All` (면제 없음) | 프레즌스 배치 (최대 650명) |
 | POST | `/api/graph/mail/send` | `graph.Mail.Send` (위임·민감) | 본인 명의 메일 발송 |
-| POST | `/api/graph/mail/send-as` | `graph.Mail.Send.app` (앱·민감) | 시스템 계정 메일 발송 (사용자 로그인 무관) |
+| POST | `/api/graph/mail/send-as` | `graph.Mail.Send.app` (앱·민감) | 시스템 계정 메일 발송 (사용자 로그인 무관 — 사람 접근 토큰 또는 서버 토큰) |
 
 그 외(개발등록 워크플로우 도구용, 일반 앱에선 드묾): GET `/api/contest/registrations`(`portal.DevRegistrations.Read`), POST `/api/admin/dev-registrations/{id}/approve`·`/reject`(Bearer + portalRole ≥ service_manager).
 
 > ⚠️ **여기 없는 Graph 기능은 pable studio가 프록시하지 않는다** — 그룹/팀 멤버(owners·members)·Teams·OneDrive·SharePoint·타인 캘린더/메일 등. 이 경우 "pable studio에서 아직 지원되지 않아요"라고 안내하고 대안을 순서대로 제시한다: ① 전체 구성원 조회(`/api/org/users`) 후 앱에서 필요한 인원만 선별(`graph.User.Read.All` 필요) ② 명단을 엑셀·CSV 로 받아 반영 ③ pable studio 관리자에게 기능 추가 요청. 브라우저에서 복사한 MS 액세스 토큰을 설정값으로 저장하는 우회는 먼저 제안하지 마라(보통 1시간 만료). 직접 Microsoft(Entra) 연동은 사용자가 명시 요청할 때만 — IT 관리자의 앱 등록·승인이 필요함을 안내하고 진행한다.
 
-`graph.*` **위임** 스코프 공통: 대상 사용자가 **pable studio에 최소 1회 로그인**했어야 하고, `/me/*` 는 JWT `sub` 본인 고정(타인 캘린더·메일 조회 불가). `send-as` 만 앱 권한이라 로그인 무관.
+`graph.*` **위임** 스코프 공통: 대상 사용자가 **pable studio에 최소 1회 로그인**했어야 하고, `/me/*` 는 JWT `sub` 본인 고정(타인 캘린더·메일 조회 불가). `send-as` 만 앱 권한이라 로그인 무관 — 로그인한 사람의 접근 토큰으로도, 자동 발송용 키로 받은 서버 토큰으로도 부를 수 있다.
 
 ## 엔드포인트별 핵심 스펙
 
@@ -81,7 +89,7 @@ const res = await fetch(`${origin}/api/org/users/${encodeURIComponent(email)}`, 
 - 쿼리: `folder`(기본 `inbox` — well-known 이름 또는 folder ID) / `top`(1~50, 기본 20) / `unreadOnly` / `search`(allowlist `^[\p{L}\p{N}\s.@_-]{1,128}$` — 한글 가능, 따옴표·콜론·백슬래시 차단)
 - `search` 와 `unreadOnly` 는 **동시 사용 불가**(400 `search_filter_conflict`), 검색 모드는 mailbox 전체라 `folder` 무시
 - 응답 `{ messages: { id, subject, from, receivedDateTime, bodyPreview, isRead, hasAttachments, importance, webLink }[], nextCursor: null }` — 본문 전체·첨부·읽음 처리는 **불가**(위젯 용도 의도적 제한). `webLink` 로 Outlook 웹 진입
-- 위젯 폴링(보통 30초) 시 Bearer TTL 60초 → 매 호출 새 토큰을 받거나 서비스 자체 재서명 토큰 사용.
+- 위젯 폴링(보통 30초) 시 접근 토큰은 60초 — 호출마다 `getAccessToken()` 을 부르면 로그인 유지(refresh)로 알아서 새로 받는다.
 
 ### 프레즌스 — 단건 GET / 배치 POST
 
@@ -97,20 +105,23 @@ const res = await fetch(`${origin}/api/org/users/${encodeURIComponent(email)}`, 
 
 ### POST /api/graph/mail/send-as — 시스템 계정 발송 (앱 스코프)
 
-- `mail/send` 와 동일 body. 사용자 로그인 무관(앱 권한) — 알림·리마인더 등 자동 발송용
-- **`from` 을 보내지 마라.** 발신 계정은 **회사(tenant)별로 pable studio 관리자가 등록**한 시스템 메일 계정으로 고정이고, 주소는 서비스에 공개되지 않는다. 어느 회사 계정이 쓰이는지는 **호출에 쓴 토큰의 `tenant_id` 클레임**이 정한다
-- **에러 분기는 하나만 하라.** 기계로 식별 가능한 값은 `error === "system_mail_from_not_registered"` 뿐이고, 나머지 403 의 `error` 는 한국어 문구(`"허용되지 않은 발신 계정"`·`"허용되지 않은 발신 도메인"`·`"허용되지 않은 replyTo 도메인"`·`"허용되지 않은 수신 도메인"`)라 문자열 비교로 분기하면 문구가 바뀔 때 조용히 깨진다.
-  - `system_mail_from_not_registered` → **회사 설정 미비**(코드 문제 아님, 재시도 금지). 응답 `message` 에 사용자에게 그대로 보여줄 한국어 문구가 담겨 오니 그걸 우선 노출하고, 없으면 `reason` 별로 안내하라:
-    - `not_registered` → "pable studio 관리자에게 요청하세요: **관리자 화면 → 회사 관리 탭 → 회사 행의 ⋯ 메뉴 → '시스템 발신 메일 등록'**"
+- `mail/send` 와 같은 body(`subject`✱·`body`✱·`to`✱ + `contentType`·`cc`·`fromName`·`replyTo`·`replyToName`, `to+cc` 최대 50명). 응답 `{ ok: true, mailSource: "tenant" | "operator" }`. 사용자 로그인 무관(앱 권한) — 알림·리마인더 등 자동 발송용
+- **로그인한 사람 없이 보낼 때**(예약·자동 발송) Bearer 는 자동 발송용 키로 받은 **서버 토큰**이다 — 코드는 `sso-v2.md` "자동 발송" 절(`lib/portal-server-token.ts`·`lib/system-mail.ts`)을 그대로 쓴다. 받는 사람·제목·내용은 앱이 정한다 — **로그인한 사용자가 보내는 메일**(동료에게 보내기·초대 등)은 `send-as` 가 아니라 위 `mail/send`(본인 명의)로 만든다(시스템 메일로 보내면 누가 보냈는지 남지 않는다)
+- **`from` 을 보내지 마라.** 발신 계정은 **회사(tenant)별로 pable studio 관리자가 등록**한 시스템 메일 계정으로 고정이고, 주소는 서비스에 공개되지 않는다. 어느 회사 계정이 쓰이는지는 **호출에 쓴 토큰의 `tenant_id` 클레임**이 정한다. 회사에 등록된 계정이 없으면 운영회사 주소로 대신 보내고(`mailSource: "operator"`) 이때 `fromName` 은 운영회사 이름으로 바뀐다
+- **에러 분기는 아래 세 값으로만 하라.** 기계로 식별 가능한 값은 `error` 의 `system_mail_from_not_registered`·`system_mail_disabled`·`system_mail_unavailable` 뿐이고, 나머지 403 의 `error` 는 한국어 문구(`"허용되지 않은 발신 계정"`·`"허용되지 않은 발신 도메인"`·`"허용되지 않은 replyTo 도메인"`·`"허용되지 않은 수신 도메인"`)라 문자열 비교로 분기하면 문구가 바뀔 때 조용히 깨진다.
+  - `system_mail_from_not_registered`(403) → **회사 설정 미비**(코드 문제 아님, 재시도 금지). 응답 `message` 에 사용자에게 그대로 보여줄 한국어 문구가 담겨 오니 그걸 우선 노출하고, 없으면 `reason` 별로 안내하라:
     - `domain_revoked` → 등록은 돼 있는데 그 주소의 도메인이 회사 허용 도메인에서 빠진 상태다(라벨도 '등록'이 아니라 '변경'). "**회사 관리 탭에서 허용 도메인을 확인한 뒤 ⋯ 메뉴 → '시스템 발신 메일 변경'** 으로 허용 도메인에 속한 주소를 다시 지정해 주세요" 라고 관리자에게 요청
-  - 그 밖의 403 → **호출 설정 오류**(`from` 을 넣었거나, 발신·`replyTo`·수신 도메인이 화이트리스트 밖). 재시도해도 안 풀리니 자동 재시도하지 말고, 응답 `error`(있으면 `blocked[]`)는 **서버 로그에만** 남기고 사용자에겐 "메일 발송이 거부됐어요" 수준으로 끝내라
+    - `not_registered`(예전 pable studio 만 — 지금은 운영회사 주소로 대신 보낸다) → "pable studio 관리자에게 요청하세요: **관리자 화면 → 회사 관리 탭 → 회사 행의 ⋯ 메뉴 → '시스템 발신 메일 등록'**"
+  - `system_mail_disabled`(403) → pable studio 전체의 시스템 발신 메일이 설정되지 않았다(회사 발신 계정도 대신 보낼 운영회사 주소도 없다) — **회사 관리자가 아니라 pable studio 운영사**가 고칠 문제다. 재시도하지 말고 응답 `message` 를 보여 주며 운영사에 알리도록 안내한다(회사가 자기 시스템 발신 계정을 등록해도 그 회사는 풀린다)
+  - `system_mail_unavailable`(503) → 발신 계정을 잠시 확인하지 못했다 — 잠시 뒤 다시 보낸다(예약 발송이면 다음 실행에서)
+  - 그 밖의 403 → **호출 설정 오류**(`from` 을 넣었거나, 발신·`replyTo`·수신 도메인이 화이트리스트 밖 — `"허용되지 않은 발신 계정"` 의 `reason` `from_mismatch`·`fallback_from_not_allowed` 포함). 재시도해도 안 풀리니 자동 재시도하지 말고, 응답 `error`(있으면 `blocked[]`)는 **서버 로그에만** 남기고 사용자에겐 "메일 발송이 거부됐어요" 수준으로 끝내라
 - 서비스별로 바꿀 수 있는 건 **표시 이름·회신 경로뿐**: `fromName: "가입 알림"` + `replyTo: "support@…"` → 수신자에겐 `"가입 알림" <등록된 발신 계정 주소>` 로 보이고 회신은 replyTo 로 간다. `replyTo` 도메인도 화이트리스트 검사 대상
 - ⚠️ **`fromName` 에 최종 사용자 입력을 그대로 넣지 마라.** pable studio는 이 값을 검사 없이 표시 이름으로 쓰므로, 폼 이름란에 `보안팀 <security@회사도메인>` 같은 값이 들어오면 **정상 발신 계정에서 온 사칭 메일**이 만들어진다. 앱이 정한 상수를 쓰고, 굳이 사용자 값을 쓴다면 `<>` 를 제거하고 길이를 제한하라
 - 수신 도메인 화이트리스트 동일 적용. 단 활동 로그에 남는 건 **발신 계정 미등록·도메인 회수·`from` 불일치**로 거부된 호출뿐이다(pable studio 활동 로그 → **시스템 메일** 필터) — 형식·수신 도메인 오류는 기록되지 않으니 관리자에게 "로그를 보라"고 안내하지 마라
 
 ## 스코프 신청
 
-- 스코프 = "이 서비스가 pable studio를 통해 호출할 수 있는 리소스 범위". **"SSO 발급 신청"** 전에 SSO 키 영역에서 필요한 스코프만 체크 → 관리자 승인.
+- 스코프 = "이 서비스가 pable studio를 통해 호출할 수 있는 리소스 범위". 사용자가 pable studio **"SSO 키"** 창에서 필요한 스코프만 골라 신청 → 관리자 승인. **키는 바뀌지 않는다**(재배선·재배포 불필요, 다음 로그인부터 반영).
 - **위임 스코프**(`graph.me.*`, 캘린더·메일·프레즌스 등)는 해당 사용자가 **pable studio에 최소 1회 로그인**했어야 한다(Microsoft refresh_token 저장). 미로그인 시 **403 `portal_login_required`** — 재시도로 안 풀리고 사용자가 pable studio에서 동의해야 함.
 - **민감 스코프**(Mail.Read/Send 등)는 매 호출마다 서버가 DB로 재확인 → 관리자가 회수하면 토큰이 유효해도 즉시 차단.
 
@@ -122,5 +133,5 @@ SSO JWT에는 사진이 없다(용량). 두 가지:
 
 ## 에러 / 키 회전
 
-- `401` = 인증 실패(서명·service 불일치·스코프 0). `403 scope_mismatch` = 서비스 `granted_scopes` 에 요구 스코프 없음(승인 필요). `403 portal_login_required` = 위임 스코프인데 사용자 pable studio 미로그인/동의 회수 — 재시도로 안 풀림. `400 invalid_request` = 쿼리·바디 검증 실패(code 필드로 세분). `502` = pable studio→Microsoft Graph 호출 실패. `503 transient` = 일시 오류, 잠시 후 재시도.
-- **키 회전**: pable studio에서 회전하면 이전 키는 즉시 무효 → 서비스 `SSO_SECRET`을 새 값으로 교체해야 함(회전 후 401 지속 = 옛 평문 잔존).
+- `401` = 인증 실패(토큰 검증 실패·승인 스코프 0·다른 회사 토큰). `403 scope_mismatch` = 서비스 `granted_scopes` 에 요구 스코프 없음(승인 필요). `403 portal_login_required` = 위임 스코프인데 사용자 pable studio 미로그인/동의 회수 — 재시도로 안 풀림. `400 invalid_request` = 쿼리·바디 검증 실패(code 필드로 세분). `502` = pable studio→Microsoft Graph 호출 실패. `503 transient` = 일시 오류, 잠시 후 재시도.
+- **키 재발급**: 스코프를 바꿔도 키는 그대로다. 키를 재발급했을 때만 이전 키가 1시간 함께 통과하고(유출 대응이면 즉시 중단) `SSO_CLIENT_SECRET` 을 새 값으로 교체한다(`claim_portal_sso_key` force → 재배포). 재발급은 등록마다 24시간에 3번까지(넘으면 `429 rotate_limit`).
