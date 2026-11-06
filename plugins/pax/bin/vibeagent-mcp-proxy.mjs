@@ -43,7 +43,7 @@ const REQUIRE_PROJECT_DIR = process.argv.includes('--require-project-dir');
 
 const PROTOCOL_VERSION = '2025-06-18';
 // version 은 마켓플레이스 배포 시 아래 placeholder 가 실제 버전으로 치환됨(단일 소스: src/lib/pluginVersion.ts).
-const SERVER_INFO = { name: 'pax-local-ai-sp', version: '2.3.2' };
+const SERVER_INFO = { name: 'pax-local-ai-sp', version: '2.3.3' };
 // 서버가 "이 사용자가 구버전인가"를 알 수 있는 유일한 신호. 서버는 **헤더 부재 = 기능 도입 이전 버전**으로
 // 판정하므로 값이 이상해도 보내는 것 자체는 유지한다(baked 상수라 실패할 수 없다).
 // 비-ASCII/제어문자가 섞이면 fetch 가 TypeError 를 던져 **전 도구 호출이 실패**하므로 필터는 필수.
@@ -332,6 +332,15 @@ const TOOLS = [
     inputSchema: MCP_CALL_INPUT,
   },
   { name: 'disconnect', description: '이 프로젝트의 PAX 연결(현재 토큰)을 즉시 취소합니다. /pax-sp:disconnect 가 먼저 이 도구를 호출해 서버에서 취소한 뒤 로컬 토큰 파일을 지웁니다. 다시 쓰려면 /pax-sp:connect.', inputSchema: NOARGS },
+];
+/**
+ * 스크립트 전용 도구(2.3.3) — 서버에는 있지만 **tools/list 에 내지 않는다**: 동기화 스크립트가 서버를 직접 부르는 도구라 모델이 볼 이유가 없고,
+ * 보이면 모델이 목록·파일을 직접 불러 컨텍스트만 태운다. 카탈로그 검사(portal-sso:selfcheck [1])는 TOOLS 와 이 목록을 합쳐 서버와 대조한다.
+ */
+const SCRIPT_ONLY_TOOLS = [
+  { name: 'list_project_skills', description: '회사·개인 스킬 목록(이름·파일별 sha256·크기)만 반환합니다(read-only). 직접 호출하지 말고 bin/vibeagent-sync-skills.mjs 가 바뀐 스킬만 골라 받습니다.', inputSchema: NOARGS },
+  { name: 'get_project_skill_files', description: '목록에 오른 스킬의 전체 파일을 이름 단위로 반환합니다(read-only, 응답당 3MB·넘치면 remaining). 직접 호출하지 말고 bin/vibeagent-sync-skills.mjs 가 씁니다.', inputSchema: { type: 'object', properties: { names: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 50 } }, required: ['names'], additionalProperties: false } },
+  { name: 'get_project_skill_assets', description: '목록에 오른 스킬 하나의 에셋(이미지·폰트·문서 등 일반 파일)을 base64 로 반환합니다(read-only, 응답당 2MB·넘치면 remaining). 직접 호출하지 말고 bin/vibeagent-sync-skills.mjs 가 씁니다.', inputSchema: { type: 'object', properties: { name: { type: 'string' }, paths: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 25 } }, required: ['name', 'paths'], additionalProperties: false } },
 ];
 
 const SESSION_TOOLS = [

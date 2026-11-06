@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 /**
- * 스킬 동기화(2.0.0 · 자동 갱신·보호 2.0.4) — `get_project_skills` 번들을 저장소 최상위의 `.claude/skills/pax-*`(Claude Code)·
+ * 스킬 동기화(2.0.0 · 자동 갱신·보호 2.0.4 · 스킬 단위 전달 2.3.3) — 회사·개인 스킬을 저장소 최상위의 `.claude/skills/pax-*`(Claude Code)·
  * `.agents/skills/pax-*`(Codex) 에 쓴다.
+ *
+ * 받는 방법(2.3.3): `list_project_skills` 로 **목록(파일별 sha256)** 만 받아 이 PC 의 파일 바이트 해시와 대조하고, 다른 스킬만
+ *  `get_project_skill_files` 로 받는다(응답당 캡은 서버가 `remaining` 으로). 변경 0 이면 호출 1번. 서버에 목록 도구가 없으면(2.3.3 미만)
+ *  구 `get_project_skills` 번들로 내려간다. 시간 예산(훅 8s·CLI 38s) 안에 못 받은 스킬은 '다음에'(이전 사본 유지·삭제 보호).
  *
  * 실행 모드:
  *  - CLI(기본): 연결 직후(`vibeagent-connect.mjs`)·로컬 세팅 스킬·`/pax-sp:sync-skills` 가 부른다. 출력 마지막 줄
- *    `[스킬 동기화] 추가 n 갱신 m 삭제 k 건너뜀 s`, 종료 코드 계약(2 폴더·3 미연결·1 번들·5 샌드박스)은 2.0.0 그대로.
+ *    `[스킬 동기화] 추가 n 갱신 m 삭제 k 건너뜀 s[ 다음에 d]`, 종료 코드 계약(2 폴더·3 미연결·1 번들·5 샌드박스)은 2.0.0 그대로.
  *  - `--hook`: Claude Code 를 열 때(SessionStart 훅, hooks/pax-hooks.json). **항상 exit 0**, 출력은 JSON 한 번
  *    (`systemMessage` = 사용자에게 보이는 안내, `hookSpecificOutput.additionalContext` = 모델에게 주는 규칙).
  *    CLI 동기화가 한 번이라도 성공한 폴더(등록부 `synced-folders.json`)에서만 동작한다 — 폴더의 remote·`.git` 은 내려받은 폴더가
@@ -17,7 +21,11 @@
  *  - `<dir>` 부터 대상까지 **모든 구성요소를 lstat** — 하나라도 심볼릭 링크면 그 스킬 skip(reason symlink). realpath 봉인.
  *  - git 이 추적 중인 경로(`git ls-files`)는 덮어쓰지 않고 경고. 파일 0644(실행 비트 없음).
  *  - 삭제는 `.pax-managed` 마커가 일반 파일인 `pax-*` 디렉터리만. degraded·도구 오류(킬스위치 deny 포함)면 삭제 0건. skipped 이름은 삭제 제외.
- *  - 교체는 `pax-x.new-<pid>` 조립 → 기존 `.old-<pid>` rename → new→final → old 삭제. 캡 50개·3MB·파일당 100KB. 셸 디렉티브 재검사.
+ *  - 교체는 `pax-x.new-<pid>` 조립 → 기존 `.old-<pid>` rename → new→final → old 삭제. 삭제는 `.del-<pid>` 로 옮긴 뒤. 캡 50개·파일당 100KB
+ *    (구 번들 경로만 총량 3MB, 새 경로는 디스크 보호 256MB — 에셋 포함). 셸 디렉티브 재검사.
+ *  - 에셋(2.3.3): 목록 `assets[]`(`assets/<이름>`·바이트 sha256) → 디스크·보관함(`state/…/asset-cache/<sha>`)에 같은 바이트가 있으면 재사용, 없는 것만
+ *    `get_project_skill_assets`(base64·remaining). 스킬 단위 원자(에셋 하나라도 못 받으면 그 스킬은 '다음에'). 서버가 에셋 전달을 멈췄거나(assetsPaused)
+ *    에셋 채널이 없는 서버(assetsChannel 없음·구 번들 폴백)면 디스크 `assets/` 는 비교·삭제에서 빼고 마커가 기록한 그대로인 것만 옮겨 보존한다.
  *  - 잠금·안내 스탬프·보관본은 저장소 밖 `~/.config/vibeagent/<instance>/state/<폴더 해시>/`(0700) — `.git` 아래에 두면
  *    `.git` 파일의 `gitdir:` 이나 심볼릭 링크로 홈의 다른 파일을 덮어쓰는 경로가 된다.
  *  - 마커 v2(`v=2`·`instance=<pax|pax-id>`·`file=<sha256> <path>`)로 **이 PC 에서 고친 사본**을 알아보고, 되돌리기 전에 보관한다.
@@ -40,14 +48,22 @@ import { callTool, resultText, PLUGIN_ID } from './lib/rpc.mjs';
 import { containsShellDirective } from './lib/skillGuard.mjs';
 
 const MCP_URL = process.env.CLAUDE_CODE_MCP_SERVER_URL || 'https://pable-pax-for-sp.vercel.app/api/local-ai/mcp';
-const PLUGIN_VERSION = '2.3.2';
+const PLUGIN_VERSION = '2.3.3';
 /** 이 플러그인의 설치 이름 — 마커 `instance=` 에 기록(원본도 명시값: 빈 값이면 마커 없는 옛 사본과 구분이 안 된다). */
 const PLUGIN_NAME = PLUGIN_ID ? `pax-${PLUGIN_ID}` : 'pax';
 const MAX_SKILLS = 50;
-const MAX_TOTAL = 3 * 1024 * 1024; // 서버 SKILLS_BUNDLE_MAX_BYTES 와 같은 값(2.3.2 에서 1MB→3MB — 천장은 Vercel 응답 본문 4.5MB)
+/** 구 경로(get_project_skills) 전용 — 서버 SKILLS_BUNDLE_MAX_BYTES 와 같은 값(2.3.2 에서 1MB→3MB). 새 경로의 응답당 캡은 서버가 remaining 으로 처리한다. */
+const MAX_TOTAL = 3 * 1024 * 1024;
+/** 새 경로에서 이 PC 에 받을 총량 상한(디스크 보호) — 서버 이론 최대(50 × (텍스트 ≈0.6MB + 에셋 10MB)) 이하지만 실사용을 크게 웃돌아 서버가 보낸 스킬을 여기서 자르는 일은 없다. */
+const MAX_LOCAL_TOTAL = 256 * 1024 * 1024; // 2.3.3 에셋 포함(스킬당 10MB 캡 × 50) — 32MB 에서 상향
+/** 에셋(2.3.3) — 전달 경로 `assets/<이름>`(평면), 파일 1MB·스킬당 25개. SYNC: src/lib/skillAssetPolicy.ts SKILL_ASSET_NAME_RE·캡(서버가 권위, 여기는 방어선) */
+const ASSET_DIR = 'assets/';
+const ASSET_NAME_RE = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/; // 점 시작만 금지 — 한글 이름은 서버가 `_` 로 바꿔 저장하므로 `_` 시작은 허용
+const MAX_ASSET = 1024 * 1024;
+const MAX_ASSETS = 25;
 const MAX_FILE = 100 * 1024;
 const NAME_RE = /^pax-[a-z][a-z0-9-]*[a-z0-9]$/;
-const TMP_RE = /^(pax-[a-z][a-z0-9-]*[a-z0-9])\.(new|old)-\d+$/;
+const TMP_RE = /^(pax-[a-z][a-z0-9-]*[a-z0-9])\.(new|old|del)-\d+$/;
 const SEG_RE = /^[\p{L}\p{N} ._-]{1,128}$/u;
 const WIN_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
 // 형제 폴더(`scripts/`·`examples/` 등, 2.2.2) — SYNC: src/lib/skillRefPath.ts REF_ROOT_RE·REF_RESERVED_ROOTS (generate-plugin-files 가드가 불일치 차단).
@@ -73,12 +89,30 @@ const RULE_LINE =
   "사용자가 바꾸길 원하면 회사 스킬은 PAX 관리자에게 요청하고, 개인 스킬은 PAX 채팅 입력창의 ＋ → 도구 관리 → 내 도구에서 고치도록 안내한다. " +
   '이 프로젝트에만 필요한 보완은 `pax-`로 시작하지 않는 새 스킬로 만든다.';
 const REASON_TEXT = {
-  limit: '개수 한도 초과', size: '용량 초과', base_name: '기본 스킬과 이름이 겹침', name_conflict: '회사 스킬과 이름이 겹침',
-  secret: '비밀값으로 보이는 내용', placeholder: '예약 문자열 포함', shell_directive: '셸 실행 표기 포함', invalid: '형식 오류',
-  bad_name: '이름 형식 오류', invalid_file: '파일 형식 오류', no_skill_md: 'SKILL.md 없음',
+  limit: '회사·개인 스킬을 합쳐 50개를 넘었어요', size: '파일 하나가 100KB 를 넘어요', base_name: 'PAX 기본 스킬과 이름이 같아요',
+  name_conflict: '같은 이름의 회사 스킬이 있어 내 스킬은 받지 않았어요', secret: '비밀값으로 보이는 내용이 있어 보내지 않았어요',
+  placeholder: 'PAX 가 쓰는 예약 표기가 들어 있어요', shell_directive: '명령을 실행하는 표기가 있어 보내지 않았어요', invalid: '스킬 파일 형식이 맞지 않아요',
+  bad_name: '이름 형식이 맞지 않아요', invalid_file: '파일 형식이 맞지 않아요', no_skill_md: 'SKILL.md 가 없어요',
+  deferred: '시간이 부족해 이번엔 받지 않았어요', download_failed: '내려받지 못했어요', local_total: '이 PC 에 받을 수 있는 스킬 총량을 넘었어요',
 };
+/** 구 번들 경로의 `size` 는 "파일 100KB" 와 "회사 합계 캡" 둘 다라 구분이 안 된다 — 종전 문구. */
+const LEGACY_SIZE_TEXT = '용량 초과';
+/** 이번에 못 받았을 뿐 다음 동기화에 다시 받는 사유 — 건너뜀과 따로 세고('다음에'), 이전 사본은 그대로. */
+const LATER_REASONS = new Set(['deferred', 'download_failed']);
+/** 사유 뒤에 **누가 조치하는지** 를 붙인다 — 회사 스킬은 관리자, 개인 스킬은 내 도구, 일시 실패는 다시 실행. 50개 초과는 개인 스킬이 밀려도 관리자 몫. */
+function reasonLine(s, legacy) {
+  const base = legacy && s.reason === 'size' ? LEGACY_SIZE_TEXT : (REASON_TEXT[s.reason] ?? s.reason);
+  const tail = LATER_REASONS.has(s.reason) ? ' — 다음 동기화 때 다시 받아요'
+    : s.reason === 'limit' || s.reason === 'local_total' || s.source === 'tenant' ? ' — 회사 관리자에게 알려 주세요'
+    : s.source === 'user' ? ' — PAX 의 도구 관리 › 내 도구에서 고쳐 주세요' : '';
+  return base + tail;
+}
 
 const HOOK = process.argv.includes('--hook');
+/** 시간 예산 — 훅은 프로세스 timeout 10s(hooks/pax-hooks.json) 안에 JSON 을 내야 하므로 8s, CLI 는 Codex sync_skills 45s·연결 직후 60s 안이라 38s. */
+const T0 = Date.now();
+const DEADLINE_MS = HOOK ? 8000 : 38_000;
+const timeLeft = () => DEADLINE_MS - (Date.now() - T0);
 
 class Stop extends Error {
   constructor(code, message) {
@@ -194,10 +228,10 @@ function parseMarker(dirPath) {
 }
 function markerText(source, files) {
   const lines = ['v=2', `instance=${PLUGIN_NAME}`, `source=${source}`, `synced=${new Date().toISOString()}`];
-  for (const f of [...files].sort((a, b) => a.path.localeCompare(b.path))) lines.push(`file=${sha256(f.content)} ${f.path.normalize('NFC')}`);
+  for (const f of [...files].sort((a, b) => a.path.localeCompare(b.path))) lines.push(`file=${f.sha256 ?? sha256(f.content)} ${f.path.normalize('NFC')}`);
   return `${lines.join('\n')}\n`;
 }
-/** 관리 폴더의 현재 파일(마커 제외) — 심볼릭 링크가 섞이면 따라가지 않고 `hasLink` 로 알린다. */
+/** 관리 폴더의 현재 파일(마커 제외, **Buffer**) — 심볼릭 링크가 섞이면 따라가지 않고 `hasLink` 로 알린다. */
 function readPresent(dirPath) {
   const files = new Map();
   let hasLink = false;
@@ -209,7 +243,7 @@ function readPresent(dirPath) {
       if (st.isDirectory()) walk(p);
       else {
         const rel = relative(dirPath, p).split(sep).join('/').normalize('NFC');
-        if (rel !== MARKER) files.set(rel, readFileSync(p, 'utf8'));
+        if (rel !== MARKER) files.set(rel, readFileSync(p)); // 바이트 — 텍스트 해시(utf8)와 같고 바이너리도 틀리지 않는다
       }
     }
   };
@@ -232,7 +266,8 @@ function localEditState(marker, present, desiredFiles) {
   }
   // v1(해시 없음): 머리말만 다른 옛 사본이면 고친 게 아니다. 그 밖엔 서버 변경인지 로컬 수정인지 알 수 없다.
   const want = new Map(desiredFiles.map((f) => [f.path.normalize('NFC'), f.path === 'SKILL.md' ? stripNotice(f.content) : f.content]));
-  if (present.files.size === want.size && [...present.files].every(([p, c]) => want.get(p) === c)) return 'clean';
+  const equal = (w, c) => (Buffer.isBuffer(w) ? w.equals(c) : w === c.toString('utf8')); // 에셋은 바이트(Buffer), 텍스트는 문자열
+  if (present.files.size === want.size && [...present.files].every(([p, c]) => equal(want.get(p), c))) return 'clean';
   return 'unknown';
 }
 /**
@@ -342,75 +377,170 @@ function lockOrSandbox(stateDir) {
   }
 }
 
+/** 경로 판정 — 목록 항목과 받은 파일에 같은 규칙. 'drop' 은 그 파일만 건너뜀(모르는 형제 폴더·Windows 예약어), 'bad' 는 스킬 통째. */
+function pathVerdict(p) {
+  if (p === 'SKILL.md') return 'ok';
+  // 스킬 폴더 바로 아래 파일(2.3.3 — LICENSE 등): 폴더 없는 이름, 점 시작·끝 점/공백·skill.md·Windows 예약어 금지. 어긋나면 그 파일만 건너뛴다.
+  if (!p.includes('/')) {
+    const okName = SEG_RE.test(p) && !p.startsWith('.') && !/[.\s]$/.test(p) && p.toLowerCase() !== 'skill.md' && p !== MARKER && !WIN_RESERVED.test(p) && !p.includes(':') && !p.includes('\\');
+    return okName ? 'ok' : 'drop';
+  }
+  const top = p.split('/')[0];
+  const isRefs = top === 'references';
+  // Windows 예약어(con·nul 등) 폴더는 서버가 보내도 그 파일만 건너뛴다 — Windows 에서 만들 수 없어 동기화 전체가 실패하지 않게
+  if (!isRefs && (!ROOT_RE.test(top) || top !== top.normalize('NFC').toLowerCase() || RESERVED_ROOTS.has(top) || WIN_RESERVED.test(top))) return 'drop';
+  const segs = p.split('/').slice(1);
+  const badSegs = segs.length === 0 || segs.length > (isRefs ? REF_SEGS_MAX : SIBLING_SEGS_MAX) ||
+    segs.some((s) => !s || s === '.' || s === '..' || !SEG_RE.test(s) || s.startsWith('.') || /[.\s]$/.test(s) || WIN_RESERVED.test(s) || s.includes(':') || s.includes('\\')) ||
+    segs[segs.length - 1].toLowerCase() === 'skill.md';
+  // references 는 종전 규칙(스킬 통째 건너뜀), 형제 폴더는 그 파일만 — 서버 규칙이 넓어져도 스킬 전달이 멈추지 않게
+  if (badSegs) return isRefs ? 'bad' : 'drop';
+  return 'ok';
+}
+/** 에셋 경로(목록 `assets[]` 채널) — `assets/<이름>` 평면만. 어긋나면 그 에셋만 건너뛴다(서버 규칙이 넓어져도 스킬 전달이 멈추지 않게). */
+function assetPathVerdict(p) {
+  if (!p.startsWith(ASSET_DIR)) return 'drop';
+  const name = p.slice(ASSET_DIR.length);
+  if (!ASSET_NAME_RE.test(name) || /[.\s]$/.test(name) || name.toLowerCase() === 'skill.md' || WIN_RESERVED.test(name)) return 'drop';
+  return 'ok';
+}
+/** `assets/` 항목을 뺀 보기 — 에셋 전달이 멈췄거나(assetsPaused) 구 서버일 때 디스크의 에셋은 비교·삭제 대상이 아니다(보존). */
+const withoutAssets = (map) => new Map([...map].filter(([p]) => !p.startsWith(ASSET_DIR)));
+/** 받은 스킬의 파일 검증(내용 포함) — { ok, files } | { ok:false, reason }. 경로 문자열(서버 값)은 출력하지 않는다 — 스킬 이름만. */
+function validateFiles(skill, name, droppedFiles) {
+  const files = [];
+  for (const f of Array.isArray(skill?.files) ? skill.files : []) {
+    const p = String(f?.path ?? '');
+    const content = typeof f?.content === 'string' ? f.content : null;
+    if (content === null || Buffer.byteLength(content) > MAX_FILE) return { ok: false, reason: 'invalid_file' };
+    const verdict = pathVerdict(p);
+    if (verdict === 'bad') return { ok: false, reason: 'invalid_file' };
+    if (verdict === 'drop') { droppedFiles.push(name); continue; }
+    if (containsShellDirective(content)) return { ok: false, reason: 'shell_directive' };
+    files.push({ path: p, content });
+  }
+  if (!files.some((f) => f.path === 'SKILL.md')) return { ok: false, reason: 'no_skill_md' };
+  return { ok: true, files };
+}
+/** rename 짧은 재시도 — Windows 에서 백신이 방금 쓴 파일을 잡고 있으면 EPERM·EBUSY 가 잠깐 난다(샌드박스 오분류 방지). */
+function renameRetry(from, to) {
+  for (let i = 0; ; i++) {
+    try { return renameSync(from, to); } catch (e) {
+      if (i >= 3 || !(e?.code === 'EPERM' || e?.code === 'EBUSY')) throw e;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
+    }
+  }
+}
+
 async function syncUnderLock({ realDir, remote, sel, stateDir, hasManaged }) {
-  const call = await callTool(MCP_URL, sel.entry.token, 'get_project_skills', {}, { pluginVersion: PLUGIN_VERSION, timeoutMs: HOOK ? 5000 : 30_000 })
-    .catch((e) => ({ ok: false, message: e?.message ?? String(e) }));
-  if (!call.ok) {
+  const callOpts = (timeoutMs) => ({ pluginVersion: PLUGIN_VERSION, timeoutMs: Math.max(500, Math.min(timeoutMs, timeLeft())) });
+  const serverFail = (call) => {
     if (HOOK) {
       // 401 = 서버에서 취소된 연결 — 만료와 같은 조건(관리 사본이 있을 때만)·같은 안내(하루 1회). 그 밖의 실패(네트워크·일시 장애)는 조용히.
       if (call.status === 401 && hasManaged && onceADay(stateDir, 'auth-expired')) {
         say('PAX 연결이 끊겨 오늘은 스킬 업데이트를 확인하지 못했어요. 최신 스킬이 필요하면 /pax-sp:connect 로 다시 연결하세요.');
       }
-      return;
+      return false;
     }
     die(1, `bundle_error: ${call.message}`);
-  }
-  const result = call.result;
-  const bundle = result?.structuredContent;
-  if (result?.isError || !bundle || !Array.isArray(bundle.skills)) {
-    if (HOOK) return;
-    die(1, `bundle_error: ${resultText(result) || '스킬 번들을 받지 못했어요'}`);
-  }
-  const degraded = bundle.degraded === true;
-  const skippedServer = Array.isArray(bundle.skipped) ? bundle.skipped : [];
+  };
+  const resultFail = (result, fallback) => {
+    if (HOOK) return false;
+    die(1, `bundle_error: ${resultText(result) || fallback}`);
+  };
 
-  // ── 검증 ───────────────────────────────────────────────────────────────────
+  // ── 1) 목록 — 2.3.3 스킬 단위 전달. 서버에 목록 도구가 없으면(구 서버) 구 번들 도구로 내려간다.
+  const listCall = await callTool(MCP_URL, sel.entry.token, 'list_project_skills', {}, callOpts(HOOK ? 4000 : 10_000))
+    .catch((e) => ({ ok: false, message: e?.message ?? String(e) }));
+  if (!listCall.ok) return serverFail(listCall);
+  let legacy = false;
+  let manifest = listCall.result?.structuredContent;
+  if (listCall.result?.isError) {
+    // 구 서버(2.3.3 미만)는 모르는 도구를 isError 결과로 돌려준다 — 그때만 폴백. 킬스위치 deny 등은 폴백하지 않는다(우회가 된다).
+    if (!/not found|unknown tool/i.test(resultText(listCall.result))) return resultFail(listCall.result, '스킬 목록을 받지 못했어요');
+    legacy = true;
+  } else if (!manifest || !Array.isArray(manifest.skills)) {
+    return resultFail(listCall.result, '스킬 목록을 받지 못했어요');
+  }
+  if (legacy) {
+    const call = await callTool(MCP_URL, sel.entry.token, 'get_project_skills', {}, callOpts(HOOK ? 5000 : 30_000))
+      .catch((e) => ({ ok: false, message: e?.message ?? String(e) }));
+    if (!call.ok) return serverFail(call);
+    manifest = call.result?.structuredContent;
+    if (call.result?.isError || !manifest || !Array.isArray(manifest.skills)) return resultFail(call.result, '스킬 번들을 받지 못했어요');
+  }
+  const degraded = manifest.degraded === true;
+  const skippedServer = Array.isArray(manifest.skipped) ? manifest.skipped : [];
+  // 에셋 보존 모드 — 서버가 에셋 전달을 멈췄거나(assetsPaused) 구 서버(에셋 채널 없음)면 디스크의 `assets/` 는 비교·삭제에서 빼고 다시 쓸 때 그대로 복사한다.
+  //  `assetsChannel` 은 2.3.3 이상 서버가 항상 싣는다 — 없으면(에셋 전달 이전 서버로 롤백 등) 에셋 채널이 없는 서버라 디스크 에셋을 지우지 않는다.
+  const keepAssets = legacy || manifest.assetsPaused === true || manifest.assetsChannel !== true;
+  const view = (map) => (keepAssets ? withoutAssets(map) : map);
+  const isAssetPath = (p) => p.startsWith(ASSET_DIR);
+
+  // ── 2) 검증 ─────────────────────────────────────────────────────────────────
   // 서버 문자열(이름·사유)은 출력 전에 형식을 확인한다 — 훅 출력은 모델·사용자에게 그대로 간다.
-  const skipped = skippedServer.map((s) => ({ name: String(s?.name ?? ''), reason: String(s?.reason ?? '') }));
-  const desired = [];
-  let total = 0;
+  const skipped = skippedServer.map((s) => ({ name: String(s?.name ?? ''), reason: String(s?.reason ?? ''), source: s?.source === 'user' ? 'user' : 'tenant' }));
   const droppedFiles = []; // 모르는 형제 폴더 경로 — 그 파일만 건너뜀
-  for (const skill of bundle.skills.slice(0, MAX_SKILLS)) {
+  /**
+   * 계획 항목 — { name, source, want: Map(path→sha256), files: [{path,content}]|null, fetch: boolean,
+   *   assetWant: Map(assets/경로→sha256), local: Map(sha256→Buffer — 디스크에서 재사용할 에셋 바이트) }
+   */
+  const plans = [];
+  let total = 0;
+  for (const skill of manifest.skills.slice(0, MAX_SKILLS)) {
     const name = String(skill?.name ?? '');
     if (!NAME_RE.test(name)) { skipped.push({ name, reason: 'bad_name' }); continue; }
-    const files = [];
-    let ok = true;
+    const source = skill.source === 'user' ? 'user' : 'tenant';
+    if (legacy) {
+      const v = validateFiles(skill, name, droppedFiles);
+      if (!v.ok) { skipped.push({ name, reason: v.reason, source }); continue; }
+      const size = v.files.reduce((n, f) => n + Buffer.byteLength(f.content) + f.path.length, 0);
+      if (total + size > MAX_TOTAL) { skipped.push({ name, reason: 'size', source }); continue; }
+      total += size;
+      plans.push({ name, source, want: new Map(v.files.map((f) => [f.path.normalize('NFC'), sha256(f.content)])), files: v.files, fetch: false, assetWant: new Map(), local: new Map() });
+      continue;
+    }
+    // 목록 항목: path·sha256·size — 내용 없음. 경로 규칙은 파일 전달과 같고, 받지 않는 파일은 대조에서도 뺀다(영원히 "바뀜" 으로 보이지 않게).
+    const want = new Map();
+    let ok = true, bytes = 0;
     for (const f of Array.isArray(skill.files) ? skill.files : []) {
       const p = String(f?.path ?? '');
-      const content = typeof f?.content === 'string' ? f.content : null;
-      if (content === null || Buffer.byteLength(content) > MAX_FILE) { ok = false; break; }
-      if (p !== 'SKILL.md') {
-        const top = p.split('/')[0];
-        const isRefs = top === 'references';
-        // Windows 예약어(con·nul 등) 폴더는 서버가 보내도 그 파일만 건너뛴다 — Windows 에서 만들 수 없어 동기화 전체가 실패하지 않게
-        if (!isRefs && (!ROOT_RE.test(top) || top !== top.normalize('NFC').toLowerCase() || RESERVED_ROOTS.has(top) || WIN_RESERVED.test(top))) {
-          droppedFiles.push(name); // 경로 문자열(서버 값)은 출력하지 않는다 — 스킬 이름(NAME_RE 통과)만
-          continue;
-        }
-        const segs = p.split('/').slice(1);
-        const badSegs = segs.length === 0 || segs.length > (isRefs ? REF_SEGS_MAX : SIBLING_SEGS_MAX) ||
-          segs.some((s) => !s || s === '.' || s === '..' || !SEG_RE.test(s) || s.startsWith('.') || /[.\s]$/.test(s) || WIN_RESERVED.test(s) || s.includes(':') || s.includes('\\')) ||
-          segs[segs.length - 1].toLowerCase() === 'skill.md';
-        if (badSegs) {
-          // references 는 종전 규칙(스킬 통째 건너뜀), 형제 폴더는 그 파일만 — 서버 규칙이 넓어져도 스킬 전달이 멈추지 않게
-          if (isRefs) { ok = false; break; }
-          droppedFiles.push(name);
-          continue;
-        }
-      }
-      if (containsShellDirective(content)) { skipped.push({ name, reason: 'shell_directive' }); ok = false; break; }
-      files.push({ path: p, content });
+      const sha = typeof f?.sha256 === 'string' && /^[a-f0-9]{64}$/.test(f.sha256) ? f.sha256 : null;
+      const size = Number.isInteger(f?.size) ? f.size : -1;
+      if (!sha || size < 0 || size > MAX_FILE) { ok = false; break; }
+      const verdict = pathVerdict(p);
+      if (verdict === 'bad') { ok = false; break; }
+      if (verdict === 'drop') { droppedFiles.push(name); continue; }
+      want.set(p.normalize('NFC'), sha);
+      bytes += size + p.length;
     }
-    if (!ok) { if (!skipped.some((s) => s.name === name)) skipped.push({ name, reason: 'invalid_file' }); continue; }
-    if (!files.some((f) => f.path === 'SKILL.md')) { skipped.push({ name, reason: 'no_skill_md' }); continue; }
-    const size = files.reduce((n, f) => n + Buffer.byteLength(f.content) + f.path.length, 0);
-    if (total + size > MAX_TOTAL) { skipped.push({ name, reason: 'size' }); continue; }
-    total += size;
-    desired.push({ name, source: skill.source === 'user' ? 'user' : 'tenant', files });
+    if (!ok) { skipped.push({ name, reason: 'invalid_file', source }); continue; }
+    if (!want.has('SKILL.md')) { skipped.push({ name, reason: 'no_skill_md', source }); continue; }
+    // 에셋(2.3.3) — 별도 채널. 경로·해시·크기 형식이 어긋난 항목은 그 에셋만 건너뛴다(목록 == 디스크 대조 집합이 되게 want 에서도 뺀다).
+    const assetWant = new Map();
+    if (!keepAssets) {
+      const list = Array.isArray(skill.assets) ? skill.assets : [];
+      if (list.length > MAX_ASSETS) droppedFiles.push(name); // 넘친 항목은 조용히 자르지 않고 안내에 포함
+      const seenLower = new Set(); // 대소문자만 다른 이름은 macOS·Windows 에서 한 파일로 합쳐져 매 세션 "바뀜" 이 된다 — 뒤쪽 항목을 건너뛴다(서버와 같은 이름순)
+      for (const a of list.slice(0, MAX_ASSETS)) {
+        const p = String(a?.path ?? '');
+        const sha = typeof a?.sha256 === 'string' && /^[a-f0-9]{64}$/.test(a.sha256) ? a.sha256 : null;
+        const size = Number.isInteger(a?.size) ? a.size : -1;
+        if (!sha || size <= 0 || size > MAX_ASSET || assetPathVerdict(p) !== 'ok') { droppedFiles.push(name); continue; }
+        const key = p.normalize('NFC');
+        if (want.has(key) || assetWant.has(key)) continue;
+        if (seenLower.has(key.toLowerCase())) { droppedFiles.push(name); continue; }
+        seenLower.add(key.toLowerCase());
+        assetWant.set(key, sha);
+        want.set(key, sha);
+        bytes += size + p.length;
+      }
+    }
+    if (total + bytes > MAX_LOCAL_TOTAL) { skipped.push({ name, reason: 'local_total', source }); continue; }
+    total += bytes;
+    plans.push({ name, source, want, files: null, fetch: false, assetWant, local: new Map() });
   }
-  for (const extra of bundle.skills.slice(MAX_SKILLS)) skipped.push({ name: String(extra?.name ?? '?'), reason: 'limit' });
-  const skippedNames = new Set(skipped.map((s) => s.name));
-  const desiredNames = new Set(desired.map((d) => d.name));
+  for (const extra of manifest.skills.slice(MAX_SKILLS)) skipped.push({ name: String(extra?.name ?? '?'), reason: 'limit' });
 
   // ── 파일시스템 안전 ──────────────────────────────────────────────────────────
   function noSymlinkWalk(target) {
@@ -431,8 +561,18 @@ async function syncUnderLock({ realDir, remote, sel, stateDir, hasManaged }) {
   function sealed(target) {
     try { return realpathSync(target).startsWith(realDir + sep); } catch { return true; }
   }
+  // git 추적 파일 — 두 루트 아래를 **한 번에** 읽어 둔다(스킬마다·위치마다 git 을 띄우면 50개 × 2 = 100회라 훅 예산을 먹는다).
+  let trackedSet = null;
   function tracked(relPath) {
-    try { return git(realDir, ['ls-files', '--', relPath]).trim().length > 0; } catch { return false; }
+    if (!trackedSet) {
+      trackedSet = new Set();
+      try {
+        for (const line of git(realDir, ['ls-files', '-z', '--', ...ROOTS.map(({ rel }) => rel.split(sep).join('/'))]).split('\0')) if (line) trackedSet.add(line);
+      } catch { /* 조회 실패 = 추적 없음으로 (종전과 같은 fail-open) */ }
+    }
+    const rel = relPath.split(sep).join('/');
+    for (const t of trackedSet) if (t === rel || t.startsWith(`${rel}/`)) return true;
+    return false;
   }
   function isManaged(path) {
     try { return lstatSync(path).isDirectory() && lstatSync(join(path, MARKER)).isFile(); } catch { return false; }
@@ -441,6 +581,121 @@ async function syncUnderLock({ realDir, remote, sel, stateDir, hasManaged }) {
     if (!HOOK) { say(`(주의) ${text}`); return; }
     if (onceADay(stateDir, `warn:${text}`)) say(`(주의) ${text}`);
   };
+
+  // ── 3) 받을 스킬 고르기 — 목록 해시 ↔ **디스크 바이트 해시**(마커가 아니라). 두 위치 중 하나라도 없거나 다르면 받는다.
+  //    마커가 v2·우리 instance 가 아니면 받는다(v1 은 서버 변경인지 로컬 수정인지 내용 없이는 못 가린다).
+  /** 3단계에서 읽은 디스크 상태(`<루트>/<이름>` → { present, marker }) — 쓰기 단계가 같은 폴더를 다시 읽고 해시하지 않게(에셋이 생기며 읽는 양이 커졌다). */
+  const presentCache = new Map();
+  if (!legacy) {
+    for (const plan of plans) {
+      for (const { rel: rootRel } of ROOTS) {
+        const final = join(realDir, rootRel, plan.name);
+        if (!existsSync(final)) { plan.fetch = true; continue; }
+        if (!isManaged(final)) continue; // 쓰기 단계가 "보존" 으로 건너뛴다 — 받아도 못 쓴다
+        const marker = parseMarker(final);
+        if (marker?.instance && marker.instance !== PLUGIN_NAME) continue; // 다른 플러그인 사본 — 건드리지 않는다
+        let present;
+        try { present = readPresent(final); } catch { plan.fetch = true; continue; }
+        presentCache.set(`${rootRel}/${plan.name}`, { present, marker });
+        if (marker?.v !== 2) { plan.fetch = true; continue; }
+        const pv = view(present.files);
+        const same = !present.hasLink && pv.size === plan.want.size && [...pv].every(([p, c]) => plan.want.get(p) === sha256(c));
+        if (!same) plan.fetch = true;
+      }
+      // 디스크 재사용 후보 — **받을 스킬만**, 두 위치 모두에서, 경로가 아니라 sha 로(한쪽 위치만 지웠거나 관리자가 이름만 바꾼 에셋도 다시 받지 않게).
+      if (plan.fetch && plan.assetWant.size) {
+        const needSha = new Set(plan.assetWant.values());
+        for (const { rel: rootRel } of ROOTS) {
+          const c = presentCache.get(`${rootRel}/${plan.name}`);
+          if (!c) continue;
+          for (const [p, buf] of c.present.files) {
+            if (!isAssetPath(p) || buf.length > MAX_ASSET) continue;
+            const h = sha256(buf);
+            if (needSha.has(h) && !plan.local.has(h)) plan.local.set(h, buf);
+          }
+        }
+      }
+    }
+    // 받다 만 에셋 보관함(내용 주소 `<sha>`) — 훅은 시간이 모자라 큰 스킬을 매 세션 받다 버릴 수 있다. 검증한 바이트를 남겨 두면 실행마다 진척이 쌓여
+    // 결국 받아진다(동기화 끝에 지금 목록에 없는 항목은 지운다). 상태 폴더 안(0700)이라 다른 사용자가 못 읽는다.
+    const assetCacheDir = join(stateDir, 'asset-cache');
+    const cacheGet = (sha) => { try { const b = readFileSync(join(assetCacheDir, sha)); return b.length <= MAX_ASSET && sha256(b) === sha ? b : null; } catch { return null; } };
+    const cachePut = (sha, buf) => { try { mkdirSync(assetCacheDir, { recursive: true, mode: 0o700 }); writeFileSync(join(assetCacheDir, sha), buf, { mode: 0o600 }); } catch { /* 보관 실패는 다음에 다시 받을 뿐 */ } };
+    /** 스킬 하나의 에셋 채우기 — 디스크·보관함 재사용 → 나머지만 get_project_skill_assets(remaining 루프, 시간 예산 안). 실패 사유 또는 null. 바이트는 sha256 으로 검증한다. */
+    async function fetchAssets(plan) {
+      const need = [];
+      for (const [p, sha] of plan.assetWant) {
+        const local = plan.local.get(sha) ?? cacheGet(sha);
+        if (local) { plan.files.push({ path: p, content: local, sha256: sha }); plan.want.set(p, sha); } else need.push(p);
+      }
+      // 훅은 받은 바이트를 쓰는 시간도 남겨야 한다 — 내려받을 게 있는데 4초 미만이면 시작하지 않는다(보관함 덕에 다음 세션에 이어 받는다).
+      if (need.length && HOOK && timeLeft() < 4000) return 'deferred';
+      let paths = need;
+      while (paths.length) {
+        if (timeLeft() < (HOOK ? 2000 : 5000)) return 'deferred';
+        const batch = paths.slice(0, MAX_ASSETS);
+        const call = await callTool(MCP_URL, sel.entry.token, 'get_project_skill_assets', { name: plan.name, paths: batch }, callOpts(HOOK ? 3000 : 25_000))
+          .catch((e) => ({ ok: false, message: e?.message ?? String(e) }));
+        const got = call.ok ? call.result?.structuredContent : null;
+        if (!call.ok || call.result?.isError || !got || !Array.isArray(got.assets)) return timeLeft() < (HOOK ? 2000 : 5000) ? 'deferred' : 'download_failed';
+        const seen = new Set();
+        for (const a of got.assets) {
+          const p = String(a?.path ?? '').normalize('NFC');
+          const sha = plan.assetWant.get(p);
+          if (!sha || !batch.includes(p) || seen.has(p) || typeof a?.base64 !== 'string') continue;
+          const buf = Buffer.from(a.base64, 'base64');
+          if (buf.length === 0 || buf.length > MAX_ASSET || sha256(buf) !== sha) continue; // 기록과 다른 바이트 — 받지 않는다(아래서 download_failed)
+          seen.add(p);
+          cachePut(sha, buf);
+          plan.files.push({ path: p, content: buf, sha256: sha });
+          plan.want.set(p, sha);
+        }
+        if (seen.size === 0) return 'download_failed'; // 진척 없는 응답(전부 remaining 등)은 더 두드리지 않는다
+        const remaining = Array.isArray(got.remaining) ? got.remaining.map(String).filter((p) => batch.includes(p) && !seen.has(p)) : [];
+        if (batch.some((p) => !seen.has(p) && !remaining.includes(p))) return 'download_failed';
+        paths = [...remaining, ...paths.slice(batch.length)];
+      }
+      return null;
+    }
+    // ── 4) 받기 — 바뀐 스킬만, 응답당 캡은 서버가 remaining 으로 알려 준다. 시간 예산 안에서 못 받은 스킬은 '다음에'(삭제 보호).
+    let names = plans.filter((p) => p.fetch).map((p) => p.name);
+    const byName = new Map(plans.map((p) => [p.name, p]));
+    const giveUp = (reason) => { for (const n of names) skipped.push({ name: n, reason, source: byName.get(n)?.source ?? 'tenant' }); names = []; };
+    while (names.length) {
+      if (timeLeft() < (HOOK ? 2000 : 5000)) { giveUp('deferred'); break; }
+      const batch = names.slice(0, MAX_SKILLS);
+      const call = await callTool(MCP_URL, sel.entry.token, 'get_project_skill_files', { names: batch }, callOpts(HOOK ? 3000 : 25_000))
+        .catch((e) => ({ ok: false, message: e?.message ?? String(e) }));
+      const result = call.ok ? call.result : null;
+      const got = result?.structuredContent;
+      if (!call.ok || result?.isError || !got || !Array.isArray(got.skills)) { giveUp(timeLeft() < (HOOK ? 2000 : 5000) ? 'deferred' : 'download_failed'); break; }
+      const seen = new Set();
+      for (const skill of got.skills) {
+        const name = String(skill?.name ?? '');
+        const plan = byName.get(name);
+        if (!plan || !batch.includes(name) || seen.has(name)) continue;
+        seen.add(name);
+        const v = validateFiles(skill, name, droppedFiles);
+        if (!v.ok) { skipped.push({ name, reason: v.reason, source: plan.source }); byName.delete(name); continue; }
+        // 목록과 받기 사이에 관리자가 고쳤을 수 있다 — 마커는 **받은 내용** 으로 쓴다(목록 해시를 강제하지 않는다).
+        plan.files = v.files;
+        plan.want = new Map(v.files.map((f) => [f.path.normalize('NFC'), sha256(f.content)]));
+        // 에셋은 스킬 단위 원자 — 하나라도 못 받으면 텍스트도 쓰지 않고 이번엔 건너뛴다(옛 사본 유지·삭제 보호).
+        if (plan.assetWant.size) {
+          const fail = await fetchAssets(plan);
+          if (fail) { skipped.push({ name, reason: fail, source: plan.source }); byName.delete(name); continue; }
+        }
+      }
+      const remaining = Array.isArray(got.remaining) ? got.remaining.map(String).filter((n) => batch.includes(n) && !seen.has(n)) : [];
+      // 요청했는데 받지도·남지도 않은 이름(서버가 더는 못 주는 스킬) — 이번엔 건너뜀(삭제 금지)
+      for (const n of batch) if (!seen.has(n) && !remaining.includes(n) && byName.has(n)) skipped.push({ name: n, reason: 'download_failed', source: byName.get(n).source });
+      names = [...remaining, ...names.slice(batch.length)];
+    }
+  }
+  const skippedNames = new Set(skipped.map((s) => s.name));
+  // 받지 못한 스킬은 계획에서 뺀다(쓰기 안 함) — 이름은 skippedNames 에 있어 삭제되지 않는다.
+  const desired = plans.filter((p) => !skippedNames.has(p.name));
+  const desiredNames = new Set(desired.map((d) => d.name));
 
   // 개수는 **스킬 이름** 기준 — 같은 스킬이 두 위치(.claude·.agents)에 놓이므로 위치마다 세면 두 배가 된다.
   const addedSet = new Set(), updatedSet = new Set(), deletedSet = new Set();
@@ -459,7 +714,7 @@ async function syncUnderLock({ realDir, remote, sel, stateDir, hasManaged }) {
       warn(`${rootRel}: 폴더를 만들 수 없어요(${e?.code ?? e})`); continue;
     }
 
-    // 강제 종료 흔적 정리 — `pax-x.new-<pid>`(조립 중)는 지우고, `.old-<pid>`(교체 중)는 본래 폴더가 없으면 되살린다.
+    // 강제 종료 흔적 정리 — `pax-x.new-<pid>`(조립 중)·`.del-<pid>`(삭제 중)는 지우고, `.old-<pid>`(교체 중)는 본래 폴더가 없으면 되살린다.
     // 이름 정규식에 안 맞아 아래 삭제 루프가 못 치우고, Claude Code 는 SKILL.md 가 있으면 스킬로 불러온다.
     for (const n of readdirSync(root)) {
       const m = n.match(TMP_RE);
@@ -478,11 +733,14 @@ async function syncUnderLock({ realDir, remote, sel, stateDir, hasManaged }) {
     for (const skill of desired) {
       const final = join(root, skill.name);
       const relFinal = join(rootRel, skill.name);
+      // 훅 시간 예산 — 받아 온 스킬을 쓸 시간이 없으면 '다음에'(10s 강제 종료로 JSON 도 못 내고 잠금만 남기는 것보다 낫다. 보관함 덕에 다음엔 바로 쓴다).
+      if (HOOK && skill.files && timeLeft() < 500) { skipped.push({ name: skill.name, reason: 'deferred', source: skill.source }); skippedNames.add(skill.name); continue; }
       if (!noSymlinkWalk(final) || !sealed(final)) { warn(`${relFinal}: 심볼릭 링크 경로라 건너뛰었어요`); skippedNames.add(skill.name); continue; }
       if (tracked(relFinal)) { warn(`${relFinal}: git 이 추적 중인 파일이 있어 덮어쓰지 않았어요(수동 정리 필요)`); skippedNames.add(skill.name); continue; }
       const existed = existsSync(final);
       if (existed && !isManaged(final)) { warn(`${relFinal}: PAX 가 만든 폴더가 아니라 보존했어요(.pax-managed 없음)`); skippedNames.add(skill.name); continue; }
-      const marker = existed ? parseMarker(final) : null;
+      const cached = existed ? presentCache.get(`${rootRel}/${skill.name}`) : null;
+      const marker = existed ? (cached ? cached.marker : parseMarker(final)) : null;
       if (marker?.instance && marker.instance !== PLUGIN_NAME) {
         warn(`${relFinal}: 다른 PAX 플러그인(${marker.instance})이 관리하는 사본이라 건드리지 않았어요`);
         skippedNames.add(skill.name);
@@ -491,20 +749,29 @@ async function syncUnderLock({ realDir, remote, sel, stateDir, hasManaged }) {
 
       let present = null;
       if (existed) {
-        try { present = readPresent(final); } catch { present = { files: new Map(), hasLink: true }; }
+        if (cached) present = cached.present;
+        else { try { present = readPresent(final); } catch { present = { files: new Map(), hasLink: true }; } }
       }
-      const want = new Map(skill.files.map((f) => [f.path.normalize('NFC'), f.content]));
-      const same = !!present && !present.hasLink && present.files.size === want.size
-        && [...present.files].every(([p, c]) => want.get(p) === c);
+      // 보존 모드(keepAssets) — 디스크의 에셋은 비교에서 빼고, **마커가 기록한 그대로인 것만** 새 사본에 옮긴다. 이 PC 에서 고친 에셋을 마커에 새 해시로 적으면
+      // "깨끗한 관리본" 으로 둔갑해 뒤에 보관 없이 덮어써지므로, 마커 줄은 옛 값을 그대로 잇고 고친 파일은 보관(localEditState → backupCopy)에만 남긴다.
+      const keptLines = keepAssets && marker ? [...marker.files].filter(([p]) => isAssetPath(p)).map(([path, sha]) => ({ path, sha256: sha })) : [];
+      const kept = keepAssets && present && marker
+        ? [...present.files].filter(([p, c]) => isAssetPath(p) && marker.files.get(p) === sha256(c)).map(([path, c]) => ({ path, content: c, sha256: marker.files.get(path) }))
+        : [];
+      const pv = present ? view(present.files) : null;
+      const same = !!present && !present.hasLink && pv.size === skill.want.size
+        && [...pv].every(([p, c]) => skill.want.get(p) === sha256(c));
       if (same) {
-        // 내용이 같아도 마커가 v2·우리 instance·현재 해시가 아니면 마커만 다시 쓴다 — 안 그러면 수정 감지가 영영 켜지지 않는다.
-        const fresh = marker?.v === 2 && marker.instance === PLUGIN_NAME && marker.files.size === want.size
-          && [...want].every(([p, c]) => marker.files.get(p) === sha256(c));
+        // 내용이 같아도 마커가 v2·우리 instance·현재 해시가 아니면 마커만 다시 쓴다 — 안 그러면 수정 감지가 영영 켜지지 않는다. 보존 모드에선 에셋 줄은 보지 않는다.
+        const mv = marker ? view(marker.files) : null;
+        const fresh = marker?.v === 2 && marker.instance === PLUGIN_NAME && mv.size === skill.want.size && [...skill.want].every(([p, h]) => mv.get(p) === h);
         if (!fresh) {
-          try { writeFileSync(join(final, MARKER), markerText(skill.source, skill.files), { mode: 0o644 }); } catch { /* 다음 번에 */ }
+          try { writeFileSync(join(final, MARKER), markerText(skill.source, [...[...skill.want].map(([path, sha]) => ({ path, sha256: sha })), ...keptLines]), { mode: 0o644 }); } catch { /* 다음 번에 */ }
         }
         continue;
       }
+      // 여기부터는 내용이 필요하다 — 받지 않은 스킬(두 위치 모두 같다고 판정)은 올 수 없지만, 그 사이 파일이 바뀐 경우를 대비해 건너뛴다.
+      if (!skill.files) { skippedNames.add(skill.name); continue; }
 
       if (existed) {
         const edit = localEditState(marker, present, skill.files);
@@ -526,19 +793,33 @@ async function syncUnderLock({ realDir, remote, sel, stateDir, hasManaged }) {
       try {
         rmSync(tmpNew, { recursive: true, force: true });
         mkdirSync(tmpNew, { recursive: true });
-        for (const f of skill.files) {
+        for (const f of [...skill.files, ...kept]) {
           const target = join(tmpNew, ...f.path.split('/'));
           mkdirSync(dirname(target), { recursive: true });
           writeFileSync(target, f.content, { mode: 0o644 });
         }
-        writeFileSync(join(tmpNew, MARKER), markerText(skill.source, skill.files), { mode: 0o644 });
-        if (existed) renameSync(final, tmpOld);
-        renameSync(tmpNew, final);
+        writeFileSync(join(tmpNew, MARKER), markerText(skill.source, [...skill.files, ...kept]), { mode: 0o644 });
+      } catch (e) {
+        // 새 폴더를 만들거나 쓰지 못함 — 샌드박스 제한(EPERM·EACCES)이면 전체 중단
+        rmSync(tmpNew, { recursive: true, force: true });
+        if (e?.code === 'EPERM' || e?.code === 'EACCES') { permissionError = e; break; }
+        warn(`${relFinal}: 쓰기 실패(${e?.code ?? e?.message ?? e})`);
+        continue;
+      }
+      try {
+        if (existed) renameRetry(final, tmpOld);
+        renameRetry(tmpNew, final);
         if (existed) rmSync(tmpOld, { recursive: true, force: true });
         if (existed) updatedSet.add(skill.name); else addedSet.add(skill.name);
       } catch (e) {
         rmSync(tmpNew, { recursive: true, force: true });
         if (!existsSync(final) && existsSync(tmpOld)) { try { renameSync(tmpOld, final); } catch { /* ignore */ } }
+        // 있던 폴더를 바꿔치기하지 못함 — Windows 에서 에셋(docx·pdf·폰트)이 다른 프로그램에 열려 있으면 EPERM·EBUSY 가 난다. 그 스킬만 다음으로(샌드박스 아님).
+        if (existed && (e?.code === 'EPERM' || e?.code === 'EBUSY')) {
+          warn(`${relFinal}: 파일이 다른 프로그램에서 열려 있어 이번엔 바꾸지 못했어요 — 닫은 뒤 다시 맞춰져요`);
+          skippedNames.add(skill.name);
+          continue;
+        }
         if (e?.code === 'EPERM' || e?.code === 'EACCES') { permissionError = e; break; }
         warn(`${relFinal}: 쓰기 실패(${e?.code ?? e?.message ?? e})`);
       }
@@ -547,6 +828,7 @@ async function syncUnderLock({ realDir, remote, sel, stateDir, hasManaged }) {
 
     // 삭제 — degraded·오류면 0건. 마커 있는 pax-* 만, desired·skipped 밖, 우리 instance(또는 옛 마커)만.
     // git 추적 중이면 쓰기와 같은 규칙으로 보존(경고). 이 PC 에서 고친 사본은 지우기 전에 보관.
+    // `.del-<pid>` 로 옮긴 뒤 지운다 — rmSync 가 마커를 먼저 지우고 죽으면 "PAX 가 만든 폴더가 아님" 으로 영구 보존되는 잔해가 남는다.
     if (!degraded) {
       for (const name of readdirSync(root)) {
         if (!NAME_RE.test(name) || desiredNames.has(name) || skippedNames.has(name)) continue;
@@ -563,11 +845,21 @@ async function syncUnderLock({ realDir, remote, sel, stateDir, hasManaged }) {
             const where = backupCopy(stateDir, tag, name, p);
             if (edited === 'modified') reverted.push({ name, where: tildify(where) });
           }
-          rmSync(p, { recursive: true, force: false });
+          const tmpDel = join(root, `${name}.del-${process.pid}`);
+          renameRetry(p, tmpDel);
+          rmSync(tmpDel, { recursive: true, force: true });
           deletedSet.add(name);
         } catch (e) { warn(`${join(rootRel, name)}: 삭제 실패(${e?.code ?? e})`); }
       }
     }
+  }
+  // 에셋 보관함 정리 — 지금 목록에 있는 sha 만 남긴다(쓰기까지 끝난 뒤라 다음 실행이 디스크에서 재사용한다. 목록에서 빠진 바이트는 더 쓸 일이 없다).
+  if (!legacy) {
+    try {
+      const live = new Set(plans.flatMap((p) => [...p.assetWant.values()]));
+      const dir = join(stateDir, 'asset-cache');
+      if (existsSync(dir)) for (const n of readdirSync(dir)) if (!live.has(n)) rmSync(join(dir, n), { force: true });
+    } catch { /* 정리 실패는 다음에 */ }
   }
   if (permissionError) {
     if (HOOK) { say(`스킬 파일을 쓸 수 없어요(${permissionError.code}) — 샌드박스 제한으로 보여요.`); return; }
@@ -614,29 +906,43 @@ async function syncUnderLock({ realDir, remote, sel, stateDir, hasManaged }) {
     say(`(주의) 이 PC에서 고쳐진 스킬(${name})을 PAX에 등록된 내용으로 되돌렸어요. 고친 내용은 ${where} 에 보관했어요.`);
     if (HOOK) modelLines.push(`PAX 스킬 동기화가 이 PC에서 고쳐진 스킬(${name})을 PAX에 등록된 내용으로 되돌렸다. 고친 내용은 ${where} 에 보관돼 있다.`);
   }
-  const shownSkipped = skipped.filter((s) => NAME_RE.test(s.name) && REASON_TEXT[s.reason]);
+  // '다음에' = 시간 예산·일시 실패로 이번에 못 받은 스킬(이 PC 의 이전 사본은 그대로) — 건너뜀과 따로 센다.
+  const later = skipped.filter((s) => NAME_RE.test(s.name) && LATER_REASONS.has(s.reason));
+  const laterNames = [...new Set(later.map((s) => s.name))];
+  const shownSkipped = skipped.filter((s) => NAME_RE.test(s.name) && REASON_TEXT[s.reason] && !LATER_REASONS.has(s.reason));
   const droppedNames = [...new Set(droppedFiles)].filter((n) => NAME_RE.test(n) && desiredNames.has(n));
   const droppedLine = droppedNames.length
-    ? `(주의) ${droppedNames.join(', ')} 스킬의 일부 폴더는 이 PC 에 만들 수 없는 이름이거나 이 PAX 플러그인 버전이 받지 못해 건너뛰었어요.`
+    ? `(주의) ${droppedNames.join(', ')} 스킬의 일부 파일·폴더는 이 PC 에 만들 수 없는 이름이거나 이 PAX 플러그인 버전이 받지 못해 건너뛰었어요.`
     : null;
   if (HOOK) {
     if (droppedLine && onceADay(stateDir, `dropped:${droppedNames.join(',')}`)) say(droppedLine);
-    for (const s of shownSkipped) if (onceADay(stateDir, `skip:${s.name}:${s.reason}`)) say(`(건너뜀) ${s.name}: ${REASON_TEXT[s.reason]}`);
+    for (const s of shownSkipped) if (onceADay(stateDir, `skip:${s.name}:${s.reason}`)) say(`(건너뜀) ${s.name}: ${reasonLine(s, legacy)}`);
+    if (laterNames.length && onceADay(stateDir, `later:${laterNames.join(',')}`)) {
+      say(`바뀐 스킬 ${laterNames.length}개(${laterNames.slice(0, 3).join(', ')}${laterNames.length > 3 ? ' …' : ''})는 이번엔 받지 않았어요. 지금 받으려면 /pax-sp:sync-skills 를 실행하세요 — 그전까지는 이 PC 의 이전 내용으로 동작해요.`);
+      modelLines.push(`PAX 스킬 ${laterNames.length}개는 이번 세션에 받지 못했다(이 PC 의 이전 내용으로 동작). 사용자가 최신 스킬을 원하면 /pax-sp:sync-skills 를 안내한다.`);
+    }
     if (degraded && onceADay(stateDir, 'degraded')) say('(주의) 서버 조회가 일부 실패해 이번엔 지우지 않았어요.');
     const parts = [];
     if (added) parts.push(`새로 받음 ${added}(${addedNames.slice(0, 3).join(', ')}${addedNames.length > 3 ? ' …' : ''})`);
     if (updated) parts.push(`바뀜 ${updated}`);
     if (deleted) parts.push(`빠짐 ${deleted}`);
+    if (laterNames.length) parts.push(`다음에 ${laterNames.length}`);
     if (parts.length) {
       userLines.unshift(`[PAX 스킬] ${parts.join(' · ')}`);
       if (createdClaudeRoot) userLines.push('새 스킬이 보이지 않으면 /reload-skills 를 실행하세요.');
     }
     return;
   }
-  for (const s of skipped) say(`(건너뜀) ${NAME_RE.test(s.name) ? s.name : '(이름 오류)'}: ${REASON_TEXT[s.reason] ?? s.reason}`);
+  for (const s of skipped) if (!LATER_REASONS.has(s.reason)) say(`(건너뜀) ${NAME_RE.test(s.name) ? s.name : '(이름 오류)'}: ${reasonLine(s, legacy)}`);
+  if (laterNames.length) {
+    // 사유 — 시간 예산(deferred)과 내려받기 실패(download_failed — 서버가 못 주는 파일·일시 오류)는 조치가 다르다.
+    const why = later.every((s) => s.reason === 'deferred') ? '시간이 오래 걸려' : later.every((s) => s.reason === 'download_failed') ? '일부 파일을 내려받지 못해' : '시간이 오래 걸리거나 일부 파일을 내려받지 못해';
+    say(`(다음에) ${why} 스킬 ${laterNames.length}개(${laterNames.join(', ')})는 이번에 받지 못했어요. /pax-sp:sync-skills 를 다시 실행하면 이어서 받아요(Codex 는 "스킬 업데이트해줘"). 계속 안 되면 회사 관리자에게 알려 주세요.`);
+  }
   if (droppedLine) say(droppedLine);
   if (degraded) say('(주의) 서버 조회가 일부 실패해 삭제는 하지 않았어요.');
-  say(`[스킬 동기화] 추가 ${added} 갱신 ${updated} 삭제 ${deleted} 건너뜀 ${skipped.length}${desired.length ? ` — 스킬은 pax-* 이름으로 자동 등장해요` : ''}`);
+  const skippedCount = skipped.length - later.length;
+  say(`[스킬 동기화] 추가 ${added} 갱신 ${updated} 삭제 ${deleted} 건너뜀 ${skippedCount}${laterNames.length ? ` 다음에 ${laterNames.length}` : ''}${desired.length ? ` — 스킬은 pax-* 이름으로 자동 등장해요` : ''}`);
 }
 
 try {
